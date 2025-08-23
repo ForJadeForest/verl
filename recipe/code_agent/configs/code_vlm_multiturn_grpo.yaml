@@ -1,0 +1,30 @@
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+data:
+  max_prompt_length: 8192
+  max_response_length: 16384
+  train_batch_size: 256
+  return_raw_chat: True
+  return_multi_modal_inputs: False
+  custom_cls:
+    path: "recipe/code_agent/code_agent.py"
+    name: CustomRLHFDataset
+
+actor_rollout_ref:
+  hybrid_engine: True    
+  rollout:
+    name: sglang
+    multi_turn:
+      enable: True
+      max_assistant_turns: 5
+      tool_config_path: "recipe/code_agent/configs/jupyter_run_config.yaml"
+
+custom_reward_function:
+  path: "recipe/code_agent/reward_fn.py"
+  name: reward_fn

@@ -1,0 +1,19 @@
+tools:
+  - class_name: "verl.tools.jupyter_tool.JupyterTool"
+    config:
+      num_workers: 256
+      rate_limit: 256
+      timeout: 60
+      type: native
+    tool_schema:
+      type: "function"
+      function:
+        name: "run_python_code_in_jupyter"
+        description: "Execute Python code in a Jupyter environment. The code will be executed in a persistent session, so variables and imports from previous executions are available. Can handle image processing and display."
+        parameters:
+          type: "object"  
+          properties:
+            code:
+              type: "string"
+              description: "The Python code to execute in the Jupyter environment."
+          required: ["code"]
