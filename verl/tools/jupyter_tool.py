@@ -40,14 +40,6 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 T = TypeVar("T")
 
 
-# Adapted from verl/tools/sandbox_fusion_tools.py
-class PoolMode(Enum):
-    """Execution pool mode enumeration."""
-
-    ThreadMode = 1
-    ProcessMode = 2
-
-
 def get_local_ip():
     """
     获取本地IP地址
@@ -69,6 +61,24 @@ def get_local_ip():
         if s:
             s.close()
     return ip
+
+
+def get_default_sandbox_url():
+    """Get default sandbox URL based on local IP."""
+    default_sandbox_url = None
+    local_ip = get_local_ip()
+    if local_ip is None:
+        return default_sandbox_url
+    else:
+        return f"http://{local_ip}:8080"
+
+
+# Adapted from verl/tools/sandbox_fusion_tools.py
+class PoolMode(Enum):
+    """Execution pool mode enumeration."""
+
+    ThreadMode = 1
+    ProcessMode = 2
 
 
 def encode_image_path_base64(image_path):
@@ -160,9 +170,9 @@ def run_jupyter_code(cell_list, sandbox_url, upload_file_dict=None, max_retries=
                     "cells": cell_list,
                     "kernel": "python3",
                     "files": upload_file_dict,
-                    "total_timeout": 10,
+                    "total_timeout": 20,
                 },
-                timeout=15,  # Add request timeout
+                timeout=22,  # Add request timeout
             )
             response.raise_for_status()  # Raise exception for HTTP errors
             
@@ -323,16 +333,8 @@ class JupyterExecutionWorker:
 
     def __init__(self, enable_global_rate_limit=True, rate_limit=10, sandbox_url=None):
         self.rate_limit_worker = self._init_rate_limit(rate_limit) if enable_global_rate_limit else None
-        self.sandbox_url = sandbox_url or self._get_default_sandbox_url()
-
-    def _get_default_sandbox_url(self):
-        """Get default sandbox URL based on local IP."""
-        default_sandbox_url = "http://29.208.50.62:16384"
-        local_ip = get_local_ip()
-        if local_ip is None:
-            return default_sandbox_url
-        else:
-            return f"http://{local_ip}:8080"
+        self.sandbox_url = get_default_sandbox_url()
+        print(f" [INFO] {self.sandbox_url=}")
 
     def _init_rate_limit(self, rate_limit):
         """Initialize singleton rate limiter."""
@@ -391,11 +393,21 @@ class JupyterTool(BaseTool):
         _tool_schema = OpenAIFunctionToolSchema.model_validate({
             "type": "function",
             "function": {
-                "name": "run_python_code_in_jupyter",
+                "name": "excute_python_code_in_jupyter",
                 "description": (
-                    "Execute Python code in a Jupyter environment. The code will be executed "
-                    "in a persistent session, so variables and imports from previous executions "
-                    "are available. Can handle image processing and display."
+                    "Execute Python code in a persistent Jupyter environment to solve a wide variety of problems. "
+                    "This powerful tool runs code and returns results and error information."
+                    "\n\n**Persistent Environment**: This is a stateful Jupyter notebook environment where:\n"
+                    "- Variables and data structures persist between code executions\n"
+                    "- Previously imported libraries remain available for reuse\n"
+                    "- Functions and classes you define are remembered\n"
+                    "- You can build upon previous computations step by step\n"
+                    "- Commonly used packages such as matplotlib, scipy, pandas, and seaborn are already installed\n"
+                    "- You can get all output (including the image output) of jupyter cell. \n\n"
+                    "Python code is incredibly versatile and can help you solve numerous types of problems:\n"
+                    "1. **Mathematical & Scientific Computing**: Perform complex calculations, solve equations, statistical analysis, linear algebra operations using libraries like NumPy, SciPy, SymPy. If you are doing math question;\n"
+                    "2. **Data Analysis & Visualization**: Process datasets, create charts and graphs, analyze trends using Pandas, Matplotlib, Plotly, Seaborn.\n"
+                    "3. **Image Processing**: Load, manipulate, crop, rotate, enhance contrast, adjust brightness, apply filters, detect features using PIL. You can use img.show() to display results."
                 ),
                 "parameters": {
                     "type": "object",
@@ -417,8 +429,8 @@ class JupyterTool(BaseTool):
         self.num_workers = config.get("num_workers", 20)
         self.rate_limit = config.get("rate_limit", 50)
         self.timeout = config.get("timeout", 30)
-        self.sandbox_url = config.get("sandbox_url")
-
+        self.sandbox_url = get_default_sandbox_url()
+        print(f" [INFO] {self.sandbox_url=}")
         self.enable_global_rate_limit = config.get("enable_global_rate_limit", True)
         self.execution_pool = init_jupyter_execution_pool(
             num_workers=self.num_workers,
@@ -481,8 +493,9 @@ class JupyterTool(BaseTool):
                 instance_data["image"] = img
                 logger.info(f"Image loaded for instance {instance_id}")
             except Exception as e:
-                logger.warning(f"Failed to load image for instance {instance_id}: {e}")
-
+                logger.info(f"Failed to load image for instance {instance_id}: {e}")
+                raise ValueError(f"Failed to load image for instance {instance_id}: {e}")
+        
         self._instance_dict[instance_id] = instance_data
         return instance_id, ToolResponse()
 
@@ -510,11 +523,11 @@ class JupyterTool(BaseTool):
 
         try:
             # Execute the code using the execution pool
-            cell_out = await ray.get(
+            cell_out = ray.get(
                 self.execution_pool.execute.remote(
                     run_jupyter_code,
                     instance_data["code_list"],
-                    instance_data.get("sandbox_url", self.sandbox_url),
+                    self.sandbox_url,
                     instance_data["upload_file_dict"],
                 )
             )
