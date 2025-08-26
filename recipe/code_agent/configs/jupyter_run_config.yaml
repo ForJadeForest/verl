@@ -1,19 +1,19 @@
 tools:
   - class_name: "verl.tools.jupyter_tool.JupyterTool"
     config:
-      num_workers: 256
-      rate_limit: 256
-      timeout: 60
+      num_workers: 16
+      rate_limit: 16
+      timeout: 30
       type: native
     tool_schema:
       type: "function"
       function:
-        name: "run_python_code_in_jupyter"
-        description: "Execute Python code in a Jupyter environment. The code will be executed in a persistent session, so variables and imports from previous executions are available. Can handle image processing and display."
+        name: "excute_python_code_in_jupyter"
+        description: "Execute Python code in a persistent Jupyter environment to solve a wide variety of problems. This powerful tool runs code and returns results and error information.\n\n**Persistent Environment**: This is a stateful Jupyter notebook environment where:\n- Variables and data structures persist between code executions\n- Previously imported libraries remain available for reuse\n- Functions and classes you define are remembered\n- You can build upon previous computations step by step\n- Commonly used packages such as matplotlib, scipy, pandas, and seaborn are already installed\n- You can get all output (including the image output) of jupyter cell. \n\nPython code is incredibly versatile and can help you solve numerous types of problems:\n1. **Mathematical & Scientific Computing**: Perform complex calculations, solve equations, statistical analysis, linear algebra operations using libraries like NumPy, SciPy, SymPy. If you are doing math question;\n2. **Data Analysis & Visualization**: Process datasets, create charts and graphs, analyze trends using Pandas, Matplotlib, Plotly, Seaborn.\n3. **Image Processing**: Load, manipulate, crop, rotate, enhance contrast, adjust brightness, apply filters, detect features using PIL. You can use img.show() to display results."
         parameters:
           type: "object"  
           properties:
             code:
               type: "string"
-              description: "The Python code to execute in the Jupyter environment."
+              description: "The Python code for a single Jupyter cell that you need to run"
           required: ["code"]
