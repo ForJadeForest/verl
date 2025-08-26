@@ -139,6 +139,9 @@ def base64_to_image(base64_str: str) -> Image.Image:
     if aspect_ratio > 200:
         raise ValueError(f"Image aspect ratio too extreme: {aspect_ratio:.2f}. Maximum allowed is 200.")
     
+    from qwen_vl_utils import fetch_image
+    image = fetch_image({"image": image, "max_pixels": 28 * 28 * 4096 * 2})
+
     return image
 
 
@@ -481,20 +484,16 @@ class JupyterTool(BaseTool):
             "response": "",
             "reward": 0.0,
         }
+        images = kwargs.get("images")
+        image_ids = kwargs.get("image_id")
 
-        # Get image from kwargs if provided
-        image = kwargs.get("image")
-        if image is not None:
-            try:
-                from qwen_vl_utils import fetch_image
-                img = fetch_image({"image": image})
-                image_id = kwargs.get("image_id", f"image_{instance_id}")
-                instance_data["upload_file_dict"][f"./{image_id}.jpg"] = encode_image_base64(img)
-                instance_data["image"] = img
-                logger.info(f"Image loaded for instance {instance_id}")
-            except Exception as e:
-                logger.info(f"Failed to load image for instance {instance_id}: {e}")
-                raise ValueError(f"Failed to load image for instance {instance_id}: {e}")
+        if images is not None:
+            # Get image from kwargs if provided
+            assert len(images) == len(image_ids), f"images and image_ids must have the same length: {len(images)} != {len(image_ids)}"  # noqa: E501
+            for image, image_id in zip(images, image_ids, strict=False):
+                instance_data["upload_file_dict"][f"./{image_id}.jpg"] = encode_image_base64(image)
+            logger.info(f"Image loaded for instance {instance_id}")
+    
         
         self._instance_dict[instance_id] = instance_data
         return instance_id, ToolResponse()
