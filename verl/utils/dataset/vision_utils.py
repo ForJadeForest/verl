@@ -27,10 +27,9 @@ def process_image(image: dict | Image.Image) -> Image.Image:
     if isinstance(image, dict) and "bytes" in image:
         assert "image" not in image, "Cannot have both `bytes` and `image`"
         image["image"] = Image.open(BytesIO(image["bytes"]))
-        image['max_pixels'] = 28 * 28 * 4096 * 2 
     if isinstance(image, str) and "base64" in image:
-        image = {"image": image, "max_pixels": 28 * 28 * 4096 * 2}
-    
+        image = {"image": image}
+
     return fetch_image(image)
 
 
