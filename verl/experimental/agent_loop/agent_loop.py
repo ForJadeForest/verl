@@ -130,6 +130,8 @@ class AgentLoopOutput(BaseModel):
     """Multi-modal data for multi-modal tools."""
     reward_score: Optional[float] = None
     """Reward score for the trajectory."""
+    reward_extra_info: dict[str, Any] = {}
+    """Reward extra info for the trajectory."""
     num_turns: int = 0
     """Number of chat turns, including user, assistant, tool."""
     metrics: AgentLoopMetrics
@@ -252,7 +254,7 @@ class RewardManagerWorker:
         )
         self.loop = asyncio.get_event_loop()
 
-    async def compute_score(self, output: AgentLoopOutput, kwargs: dict) -> float:
+    async def compute_score(self, output: AgentLoopOutput, return_dict: bool, kwargs: dict) -> float:
         """Compute reward score for agent loop output.
 
         NOTE: Since `reward_manager.__call__` is blocking function, we run it in thread pool to
@@ -284,12 +286,19 @@ class RewardManagerWorker:
             batch=batch,
             non_tensor_batch=non_tensor_batch,
         )
-        reward_tensor = await self.loop.run_in_executor(
+        reward_result = await self.loop.run_in_executor(
             None,
             self.reward_manager,
             data,
+            return_dict,
         )
-        return reward_tensor.sum(dim=-1).item()
+        reward_tensor = reward_result["reward_tensor"].sum(dim=-1).item()
+        if return_dict:
+            reward_extra_info = reward_result.get("reward_extra_info", {})
+            print(f" [INFO] reward_extra_info in RewardManagerWorker: {reward_extra_info}")
+            return {"reward_tensor": reward_tensor, "reward_extra_info": reward_extra_info}
+        else:
+            return reward_tensor
 
 
 @ray.remote
@@ -424,7 +433,9 @@ class AgentLoopWorker:
 
             # Some AgentLoop may have already computed the reward score, e.g SWE-agent.
             if output.reward_score is None and not self.config.reward_model.enable:
-                output.reward_score = await self.reward_manager_worker.compute_score.remote(output, kwargs)
+                reward_result = await self.reward_manager_worker.compute_score.remote(output, True, kwargs)
+                output.reward_score = reward_result["reward_tensor"]
+                output.reward_extra_info = reward_result["reward_extra_info"]
 
             # NOTE: consistent with batch version of generate_sequences in vllm_rollout_spmd.py
             # prompt_ids: left padded with zeros (e.g., [0,0,0,0,1,2,3,4])
@@ -532,6 +543,7 @@ class AgentLoopWorker:
                 multi_modal_inputs=multi_modal_inputs,
                 multi_modal_data=output.multi_modal_data,
                 reward_score=output.reward_score,
+                reward_extra_info=output.reward_extra_info,
                 num_turns=output.num_turns,
                 metrics=output.metrics,
             )
@@ -564,6 +576,16 @@ class AgentLoopWorker:
         )
 
         scores = [input.reward_score for input in inputs]
+
+        reward_extra_infos = [input.reward_extra_info for input in inputs]
+        need_log_reward_keys = self.config.reward_model.get("log_reward_keys", [])
+        print(f" [INFO] need_log_reward_keys: {need_log_reward_keys}")
+        reward_extra_info_dict = {k: [] for k in need_log_reward_keys}
+        reward_mask_value = self.config.reward_model.get("reward_mask", -100)
+        for reward_extra_info in reward_extra_infos:
+            for key in need_log_reward_keys:
+                reward_extra_info_dict[key].append(reward_extra_info.get(key, reward_mask_value))
+        print(reward_extra_info_dict)
         if all(score is not None for score in scores):
             prompt_length = prompt_ids.size(1)
             response_length = attention_mask[:, prompt_length:].sum(dim=1) - 1
@@ -581,7 +603,11 @@ class AgentLoopWorker:
             non_tensor_batch["multi_modal_inputs"] = np.array(multi_modal_inputs_list, dtype=object)
 
         metrics = [input.metrics.model_dump() for input in inputs]
-        return DataProto(batch=batch, non_tensor_batch=non_tensor_batch, meta_info={"metrics": metrics})
+        return DataProto(
+            batch=batch,
+            non_tensor_batch=non_tensor_batch,
+            meta_info={"metrics": metrics, "reward_extra_info": reward_extra_info_dict},
+        )
 
 
 async def get_trajectory_info(step, index, validate):
