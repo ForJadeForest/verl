@@ -753,8 +753,10 @@ class RayPPOTrainer:
             assert len(lst) == 0 or len(lst) == len(sample_scores), f"{key_info}: {len(lst)=}, {len(sample_scores)=}"
 
         data_sources = np.concatenate(data_source_lst, axis=0)
-
-        data_src2var2metric2val = process_validation_metrics(data_sources, sample_inputs, reward_extra_infos_dict)
+        reward_mask = self.config.reward_model.get("reward_mask", -100)
+        data_src2var2metric2val = process_validation_metrics(
+            data_sources, sample_inputs, reward_extra_infos_dict, reward_mask=reward_mask,
+        )
         metric_dict = {}
         for data_source, var2metric2val in data_src2var2metric2val.items():
             core_var = "acc" if "acc" in var2metric2val else "reward"
@@ -1154,6 +1156,7 @@ class RayPPOTrainer:
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
+                    print(f" [INFO] batch.meta_info: {batch.meta_info}")
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
@@ -1178,7 +1181,7 @@ class RayPPOTrainer:
                             future_reward = compute_reward_async.remote(data=batch, reward_fn=self.reward_fn)
                         else:
                             reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
-
+                    print(f" [INFO] reward_extra_infos_dict: {reward_extra_infos_dict}")
                     # recompute old_log_probs
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
                         old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
@@ -1352,6 +1355,19 @@ class RayPPOTrainer:
                 # TODO: implement actual tflpo and theoretical tflpo
                 n_gpus = self.resource_pool_manager.get_n_gpus()
                 metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
+
+                reward_keys = list(filter(lambda x: x.endswith("reward"), batch.non_tensor_batch.keys()))
+                if reward_keys:
+                    sub_reward_metrics = {}
+                    reward_mask = self.config.reward_model.get("reward_mask", -100)
+                    for k in reward_keys:
+                        reward_tensor = batch.non_tensor_batch[k]
+                        valid_reward_tensor = reward_tensor[reward_tensor != reward_mask]
+                        sub_reward_metrics[f"reward/{k}_mean"] = np.mean(valid_reward_tensor)
+                        sub_reward_metrics[f"reward/{k}_max"] = np.max(valid_reward_tensor)
+                        sub_reward_metrics[f"reward/{k}_min"] = np.min(valid_reward_tensor)
+                        sub_reward_metrics[f"reward/{k}_std"] = np.std(valid_reward_tensor)
+                    metrics.update(sub_reward_metrics)
 
                 # this is experimental and may be changed/removed in the future in favor of a general-purpose one
                 if isinstance(self.train_dataloader.sampler, AbstractCurriculumSampler):

@@ -380,7 +380,11 @@ def calc_maj_val(data: list[dict[str, Any]], vote_key: str, val_key: str) -> flo
 
 
 def process_validation_metrics(
-    data_sources: list[str], sample_inputs: list[str], infos_dict: dict[str, list[Any]], seed: int = 42
+    data_sources: list[str],
+    sample_inputs: list[str],
+    infos_dict: dict[str, list[Any]],
+    seed: int = 42,
+    reward_mask: int = -100,
 ) -> dict[str, dict[str, dict[str, float]]]:
     """
     Process validation metrics into a structured format with statistical analysis.
@@ -429,6 +433,8 @@ def process_validation_metrics(
         prompt = sample_inputs[sample_idx]
         var2vals = data_src2prompt2var2vals[data_source][prompt]
         for var_name, var_vals in infos_dict.items():
+            if var_vals[sample_idx] == reward_mask:
+                continue  # skip invalid value
             var2vals[var_name].append(var_vals[sample_idx])
 
     # Calculate metrics for each group
