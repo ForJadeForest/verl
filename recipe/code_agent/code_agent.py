@@ -19,7 +19,22 @@ class CustomRLHFDataset(RLHFDataset):
         Note that we also return the raw_input_ids so that it can be combined with other chat template
         """
         row_dict: dict = self.dataframe[item]
-
+        # assert only one row_dict[self.prompt_key]
+        assert len(row_dict[self.prompt_key]) == 1, f"Only one prompt is supported: {row_dict[self.prompt_key]}"
+        assert row_dict[self.prompt_key][0]["role"] == "user", f"Only user prompt is supported: {row_dict[self.prompt_key]}"
+        
+        row_dict[self.prompt_key] = [
+            {
+                "role": "system",
+                # We don't need tool description, because custom_chat_template will add it.
+                "content": (
+                    "You are a helpful assistant. You can call functions to assist with the user query. "
+                    "Important: You must call only one function at a time. After each function call, "
+                    "wait for the execution result before making the next function call if needed."
+                ),
+            },
+            *row_dict[self.prompt_key]
+        ]
         messages = self._build_messages(row_dict)
         model_inputs = {}
 
@@ -29,8 +44,10 @@ class CustomRLHFDataset(RLHFDataset):
 
             images = None
             if self.image_key in row_dict and row_dict.get(self.image_key, None) is not None:
-                images = [Image.open(io.BytesIO(image["bytes"])) for image in row_dict.pop(self.image_key)]
+                from verl.utils.dataset.vision_utils import process_image
 
+                images = [process_image(image) for image in row_dict.pop(self.image_key)]
+    
                 # due to the image key is "image" instead of "images" in vllm, we need to use "image" here
                 # link: https://github.com/vllm-project/vllm/blob/3c545c0c3b98ee642373a308197d750d0e449403/vllm/multimodal/parse.py#L205  # noqa: E501
                 multi_modal_data["image"] = images
@@ -114,9 +131,19 @@ class CustomRLHFDataset(RLHFDataset):
 
         # add index for each prompt
         index = row_dict.get("extra_info", {}).get("index", 0)
+        if isinstance(row_dict["image_id"], str):
+            row_dict["image_id"] = [row_dict["image_id"]]
+        assert isinstance(row_dict["image_id"], list), f"image_id must be a list: {row_dict['image_id']}"
+        assert len(row_dict["image_id"]) == len(images)
+        
+        assert isinstance(row_dict["image_id"][0], str), f"image_id must be a list of strings: {row_dict['image_id']}"
+
         tools_kwargs = {
-            "run_python_code_in_jupyter": {
-                "create_kwargs": {"image": images[0]},
+            "excute_python_code_in_jupyter": {
+                "create_kwargs": {
+                    "images": images,
+                    "image_id": row_dict["image_id"],
+                },
                 # "execute_kwargs": {},
                 # "calc_reward_kwargs": {},
                 # "release_kwargs": {},
