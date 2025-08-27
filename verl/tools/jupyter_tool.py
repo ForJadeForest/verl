@@ -222,8 +222,9 @@ def parse_cell_output(cell_output: dict) -> dict:
         # traceback = e.get("traceback", "")
         e_name = e.get("ename", "")
         e_value = e.get("evalue", "")
-        error_message = f"[CODE RUN ERROR]: {e_name} - {e_value}\n\nPlease read the bug information and fix it to continue solve the question."
-
+        error_message = f"[CODE RUN ERROR]: {e_name} - {e_value}\n\nPlease read the bug information and fix it to continue solve the question. Hint: All variables in this cell can not be used in the next cell."
+        if len(error_message) > 3000:
+            error_message = error_message[:1500] + "..." + error_message[-1500:]
     # show display output
     display_output = cell_output.get("display", [])
     display_text = ""
@@ -247,10 +248,6 @@ def parse_cell_output(cell_output: dict) -> dict:
         text_output += f"error: {error_message}\n"
 
     image_output = display_image
-    if "<image>" in text_output:
-        logger.warning("Found <image> in text output, indicating image generation.")
-        text_output = text_output.replace("<image>", "")
-        logger.warning("Replaced <image> in text output with empty string.")
     return {
         "text_output": text_output.strip(),
         "image_output": image_output,
