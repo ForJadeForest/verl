@@ -295,7 +295,6 @@ class RewardManagerWorker:
         reward_tensor = reward_result["reward_tensor"].sum(dim=-1).item()
         if return_dict:
             reward_extra_info = reward_result.get("reward_extra_info", {})
-            print(f" [INFO] reward_extra_info in RewardManagerWorker: {reward_extra_info}")
             return {"reward_tensor": reward_tensor, "reward_extra_info": reward_extra_info}
         else:
             return reward_tensor
@@ -373,7 +372,11 @@ class AgentLoopWorker:
             top_p=config.top_p,
             repetition_penalty=1.0,
             logprobs=config.calculate_log_probs,
+            max_new_tokens=config.multi_turn.get("single_max_new_tokens", config.response_length),
         )
+        print(f" [INFO] sampling_params: {sampling_params}")
+        print(f" [INFO] config.multi_turn['single_max_new_tokens']: {config.multi_turn.get('single_max_new_tokens', config.response_length)}")
+        print(f" [INFO] config.response_length: {config.response_length}")
 
         # override sampling params for validation
         if batch.meta_info.get("validate", False):
@@ -435,6 +438,9 @@ class AgentLoopWorker:
             if output.reward_score is None and not self.config.reward_model.enable:
                 reward_result = await self.reward_manager_worker.compute_score.remote(output, True, kwargs)
                 output.reward_score = reward_result["reward_tensor"]
+                for key, value in reward_result["reward_extra_info"].items():
+                    assert isinstance(value, list) and len(value) == 1, f"value must be a list: {value}"
+                    reward_result["reward_extra_info"][key] = value[0]
                 output.reward_extra_info = reward_result["reward_extra_info"]
 
             # NOTE: consistent with batch version of generate_sequences in vllm_rollout_spmd.py
@@ -509,9 +515,33 @@ class AgentLoopWorker:
 
                 images = output.multi_modal_data.get("image", None)
                 current_text = self.tokenizer.decode(input_ids.squeeze(0), skip_special_tokens=True)
-                multi_modal_inputs = self.processor(text=[current_text], images=images, return_tensors="pt")
+                # Max pixels is 6422528, which is 28 * 28 * 8192
+                multi_modal_inputs = self.processor(
+                    text=[current_text], images=images, return_tensors="pt", max_pixels=6422528
+                )
+                for key in multi_modal_inputs.keys():
+                    if key == "image_grid_thw":
+                        if hasattr(multi_modal_inputs[key], 'dtype') and 'float' in str(multi_modal_inputs[key].dtype):
+                            multi_modal_inputs[key] = multi_modal_inputs[key].to(torch.int64)
+                
+                    if key == "video_grid_thw":
+                        if hasattr(multi_modal_inputs[key], "dtype") and "float" in str(multi_modal_inputs[key].dtype):
+                            multi_modal_inputs[key] = multi_modal_inputs[key].to(torch.int64)
+
                 multi_modal_inputs.pop("input_ids", None)
                 multi_modal_inputs.pop("attention_mask", None)
+
+                # pixels_values = multi_modal_inputs.get("pixel_values", None)
+                # image_features_num = pixels_values.shape[0] // 2 // 2
+                # image_token_num = (input_ids == 151655).sum().item()
+                # if image_features_num != image_token_num:
+                #     print(f" [ERROR] image_features_num: {image_features_num} != image_token_num: {image_token_num}")
+                #     print(f" [ERROR] len(images): {len(images)}")
+                #     image_start_token_num = (input_ids == 151652).sum().item()
+                #     image_end_token_num = (input_ids == 151653).sum().item()
+                #     print(f" [ERROR] image_start_token_num: {image_start_token_num}")
+                #     print(f" [ERROR] image_end_token_num: {image_end_token_num}")
+
 
                 # We must use dict(multi_modal_inputs) to convert BatchFeature values to a new dict
                 # because np.array() only keeps the keys for BatchFeature.
@@ -520,15 +550,20 @@ class AgentLoopWorker:
                 image_grid_thw = multi_modal_inputs.get("image_grid_thw")
                 video_grid_thw = multi_modal_inputs.get("video_grid_thw")
                 second_per_grid_ts = multi_modal_inputs.get("second_per_grid_ts")
-
-                position_ids = get_rope_index(
-                    self.processor,
-                    input_ids=input_ids.squeeze(0),
-                    image_grid_thw=image_grid_thw,
-                    video_grid_thw=video_grid_thw,
-                    second_per_grid_ts=second_per_grid_ts,
-                    attention_mask=attention_mask.squeeze(0),
-                ).unsqueeze(0)  # (1, 3, seq_len)
+                try:
+                    position_ids = get_rope_index(
+                        self.processor,
+                        input_ids=input_ids.squeeze(0),
+                        image_grid_thw=image_grid_thw,
+                        video_grid_thw=video_grid_thw,
+                        second_per_grid_ts=second_per_grid_ts,
+                        attention_mask=attention_mask.squeeze(0),
+                    ).unsqueeze(0)  # (1, 3, seq_len)
+                except Exception as e:
+                    print(f" [ERROR] get_rope_index failed: {e}")
+                    print(f" [ERROR] image_grid_thw: {image_grid_thw}")
+                    print(f" [ERROR] image_grid_thw shape: {image_grid_thw.shape}")
+                    raise e
             else:
                 position_ids = compute_position_id_with_mask(attention_mask)  # (1, seq_len)
 
@@ -578,14 +613,17 @@ class AgentLoopWorker:
         scores = [input.reward_score for input in inputs]
 
         reward_extra_infos = [input.reward_extra_info for input in inputs]
+
         need_log_reward_keys = self.config.reward_model.get("log_reward_keys", [])
-        print(f" [INFO] need_log_reward_keys: {need_log_reward_keys}")
-        reward_extra_info_dict = {k: [] for k in need_log_reward_keys}
         reward_mask_value = self.config.reward_model.get("reward_mask", -100)
+        new_reward_extra_info_list = []
         for reward_extra_info in reward_extra_infos:
             for key in need_log_reward_keys:
-                reward_extra_info_dict[key].append(reward_extra_info.get(key, reward_mask_value))
-        print(reward_extra_info_dict)
+                if key not in reward_extra_info:
+                    reward_extra_info[key] = reward_mask_value
+            new_reward_extra_info_list.append(reward_extra_info)
+        new_reward_extra_info_list = np.array(new_reward_extra_info_list, dtype=object)
+
         if all(score is not None for score in scores):
             prompt_length = prompt_ids.size(1)
             response_length = attention_mask[:, prompt_length:].sum(dim=1) - 1
@@ -595,6 +633,7 @@ class AgentLoopWorker:
 
         non_tensor_batch = {
             "__num_turns__": np.array([input.num_turns for input in inputs], dtype=np.int32),
+            "reward_extra_info": new_reward_extra_info_list,
         }
 
         # Add multi_modal_inputs to non_tensor_batch if any samples have them
@@ -606,7 +645,7 @@ class AgentLoopWorker:
         return DataProto(
             batch=batch,
             non_tensor_batch=non_tensor_batch,
-            meta_info={"metrics": metrics, "reward_extra_info": reward_extra_info_dict},
+            meta_info={"metrics": metrics},
         )
 
 
