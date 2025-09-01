@@ -22,13 +22,14 @@ from qwen_vl_utils import fetch_image, fetch_video
 
 def process_image(image: dict | Image.Image) -> Image.Image:
     if isinstance(image, Image.Image):
-        return image.convert("RGB")
+        return fetch_image({"image": image, "max_pixels": 28 * 28 * 4096 * 2})
 
     if isinstance(image, dict) and "bytes" in image:
         assert "image" not in image, "Cannot have both `bytes` and `image`"
         image["image"] = Image.open(BytesIO(image["bytes"]))
+        image["max_pixels"] = 28 * 28 * 4096 * 2
     if isinstance(image, str) and "base64" in image:
-        image = {"image": image}
+        image = {"image": image, "max_pixels": 28 * 28 * 4096 * 2}
 
     return fetch_image(image)
 
