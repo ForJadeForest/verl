@@ -82,7 +82,23 @@ class AsyncSGLangServer(AsyncServerBase):
         request_id: str,
         image_data: Optional[list[Any]] = None,
     ) -> TokenOutput:
-        return await self.master_worker.generate.remote(prompt_ids, sampling_params, request_id, image_data=image_data)
+        try:
+            return await self.master_worker.generate.remote(prompt_ids, sampling_params, request_id, image_data=image_data)
+        except Exception as e:
+            print("INPUT DATA")
+            print("PROMPT_IDS:", len(prompt_ids))
+            print("PROMPT_IDS:", prompt_ids)
+            image_token_num = prompt_ids.count(151655)
+            print("IMAGE_TOKEN_NUM:", image_token_num)
+            print("SAMPLING_PARAMS:", sampling_params)
+            print("REQUEST_ID:", request_id)
+            print("IMAGE_DATA:", image_data)
+            print("len(IMAGE_DATA):", len(image_data))
+            logger.error(f"Error generating: {e}")
+            # print the stack trace
+            import traceback
+            traceback.print_exc()
+            raise e
 
     async def wake_up(self):
         if not self.config.rollout.free_cache_engine:

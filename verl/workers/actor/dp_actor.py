@@ -318,31 +318,55 @@ class DataParallelPPOActor(BasePPOActor):
         """
         # set to eval
         self.actor_module.eval()
+        try:
+            micro_batch_size = data.meta_info["micro_batch_size"]
+            temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
+            use_dynamic_bsz = data.meta_info["use_dynamic_bsz"]
+            has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
+            select_keys = ["responses", "input_ids", "attention_mask", "position_ids"]
+            non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
 
-        micro_batch_size = data.meta_info["micro_batch_size"]
-        temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
-        use_dynamic_bsz = data.meta_info["use_dynamic_bsz"]
-        has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
-        select_keys = ["responses", "input_ids", "attention_mask", "position_ids"]
-        non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
+            data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
 
-        data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
-
-        if use_dynamic_bsz:
-            max_token_len = data.meta_info["max_token_len"] * self.ulysses_sequence_parallel_size
-            micro_batches, batch_idx_list = prepare_dynamic_batch(data, max_token_len=max_token_len)
-        else:
-            micro_batches = data.split(micro_batch_size)
+            if use_dynamic_bsz:
+                max_token_len = data.meta_info["max_token_len"] * self.ulysses_sequence_parallel_size
+                micro_batches, batch_idx_list = prepare_dynamic_batch(data, max_token_len=max_token_len)
+            else:
+                micro_batches = data.split(micro_batch_size)
+        except Exception as e:
+            print(f" [ERROR] Prepare micro_batches failed, {data.meta_info=}")
+            print(f" [ERROR] {e=}")
+            raise e
 
         log_probs_lst = []
         entropy_lst = []
         for micro_batch in micro_batches:
-            micro_batch = micro_batch.to(get_device_id())
-            model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
+            try:
+                micro_batch = micro_batch.to(get_device_id())
+                model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
+            except Exception as e:
+                print(f" [ERROR] move to device failed, {micro_batch.meta_info=}")
+                print(f" [ERROR] {e=}")
+                raise e
             with torch.no_grad():
-                entropy, log_probs = self._forward_micro_batch(
-                    model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
-                )
+                try:
+                    entropy, log_probs = self._forward_micro_batch(
+                        model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
+                    )
+                except Exception as e:
+                    print(f" [ERROR] {e=}")
+                    image_token_num = (model_inputs["input_ids"] == 151655).sum()
+                    image_start_token = (model_inputs["input_ids"] == 151652).sum()
+                    image_end_token = (model_inputs["input_ids"] == 151653).sum()
+                    print(f" [ERROR] image_token_num: {image_token_num}")
+                    print(f" [ERROR] image_start_token: {image_start_token}")
+                    print(f" [ERROR] image_end_token: {image_end_token}")
+                    
+                    for key in model_inputs.keys():
+                        print(f" [ERROR] {key}: {model_inputs[key].shape}")
+                    for key in model_inputs["multi_modal_inputs"][0].keys():
+                        print(f" [ERROR] {key}: {model_inputs['multi_modal_inputs'][0][key].shape}")
+                    raise e
             log_probs_lst.append(log_probs)
             if calculate_entropy:
                 entropy_lst.append(entropy)
