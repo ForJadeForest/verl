@@ -22,7 +22,7 @@ class CustomRLHFDataset(RLHFDataset):
         # assert only one row_dict[self.prompt_key]
         assert len(row_dict[self.prompt_key]) == 1, f"Only one prompt is supported: {row_dict[self.prompt_key]}"
         assert row_dict[self.prompt_key][0]["role"] == "user", f"Only user prompt is supported: {row_dict[self.prompt_key]}"
-        
+        query = row_dict[self.prompt_key][0]["content"]
         row_dict[self.prompt_key] = [
             {
                 "role": "system",
@@ -52,7 +52,7 @@ class CustomRLHFDataset(RLHFDataset):
                 # link: https://github.com/vllm-project/vllm/blob/3c545c0c3b98ee642373a308197d750d0e449403/vllm/multimodal/parse.py#L205  # noqa: E501
                 multi_modal_data["image"] = images
 
-            model_inputs = self.processor(text=[raw_prompt], images=images, return_tensors="pt")
+            model_inputs = self.processor(text=[raw_prompt], images=images, return_tensors="pt", max_pixels=6422528)
 
             input_ids = model_inputs.pop("input_ids")
             attention_mask = model_inputs.pop("attention_mask")
@@ -133,13 +133,16 @@ class CustomRLHFDataset(RLHFDataset):
         index = row_dict.get("extra_info", {}).get("index", 0)
         if isinstance(row_dict["image_id"], str):
             row_dict["image_id"] = [row_dict["image_id"]]
-        assert isinstance(row_dict["image_id"], list), f"image_id must be a list: {row_dict['image_id']}"
+        for image_id in row_dict["image_id"]:
+            assert image_id in query, f"image_id {image_id} not in query {query}"
+        
+        assert isinstance(row_dict["image_id"], list), f"image_id a be a list: {row_dict['image_id']}"
         assert len(row_dict["image_id"]) == len(images)
         
         assert isinstance(row_dict["image_id"][0], str), f"image_id must be a list of strings: {row_dict['image_id']}"
 
         tools_kwargs = {
-            "excute_python_code_in_jupyter": {
+            "execute_python_code_in_jupyter": {
                 "create_kwargs": {
                     "images": images,
                     "image_id": row_dict["image_id"],

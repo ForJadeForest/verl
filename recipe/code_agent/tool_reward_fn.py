@@ -196,7 +196,7 @@ def check_format(predict_str):
     if predict_str.endswith("<|im_end|>"):
         predict_str = predict_str[: -len("<|im_end|>")]
 
-    think_format_pattern = r"^<think>(?s:(?:(?!</think>).)*)</think>\n{1,2}<answer>(?s:(?:(?!</answer>).)*)</answer>\Z"
+    think_format_pattern = r"^<think>(?s:(?:(?!</think>).)*)</think>\n<answer>(?s:(?:(?!</answer>).)*)</answer>\Z"
     if not re.match(think_format_pattern, predict_str):
         is_format_error = True
 
@@ -234,7 +234,6 @@ def check_format(predict_str):
         and tool_call_1 == tool_call_2
         and tool_response_1 == tool_response_2
         and tool_response_1 == tool_call_1
-        and not is_format_error
     ):
         give_tool_reward = True
 
@@ -307,7 +306,9 @@ def compute_score(predict_str: str, ground_truth: str, extra_info=None) -> dict:
 
     format_reward = 0 if is_format_error else 1.0
     code_panelty = compute_code_panelty(predict_str)
-    final_score = 1.0 * acc_reward + 0.25 * format_reward + code_panelty
+    tool_reward = 1.0 if give_tool_reward and code_panelty == 0 else 0.0
+
+    final_score = 1.0 * acc_reward + 0.25 * format_reward + code_panelty + tool_reward
 
     return {
         "score": final_score,
@@ -315,6 +316,7 @@ def compute_score(predict_str: str, ground_truth: str, extra_info=None) -> dict:
         "acc_reward": acc_reward,
         "acc": acc_reward,
         "code_error_reward": code_panelty,
+        "tool_reward": tool_reward,
     }
 
 
@@ -392,7 +394,8 @@ def compute_score_math(predict_str: str, ground_truth: str, extra_info=None) -> 
 
     format_reward = 0 if is_format_error else 1.0
     code_panelty = compute_code_panelty(predict_str)
-    final_score = 1.0 * acc_reward + 0.25 * format_reward + code_panelty
+    tool_reward = 1.0 if give_tool_reward and code_panelty == 0 else 0.0
+    final_score = 1.0 * acc_reward + 0.25 * format_reward + code_panelty + tool_reward
 
     return {
         "score": final_score,
@@ -400,6 +403,7 @@ def compute_score_math(predict_str: str, ground_truth: str, extra_info=None) -> 
         "acc_reward": acc_reward,
         "acc": acc_reward,
         "code_error_reward": code_panelty,
+        "tool_reward": tool_reward,
     }
 
 
@@ -546,7 +550,8 @@ def compute_ground_score(predict_str: str, ground_truth: str, extra_info=None) -
 
     format_reward = 0 if is_format_error else 1.0
     code_panelty = compute_code_panelty(predict_str)
-    final_score = 0.5 * acc_reward + 0.25 * format_reward + 0.5 * ground_reward + code_panelty
+    tool_reward = 1.0 if give_tool_reward and code_panelty == 0 else 0.0
+    final_score = 0.5 * acc_reward + 0.25 * format_reward + 0.5 * ground_reward + code_panelty + tool_reward
     
     return {
         "score": final_score,
@@ -555,6 +560,7 @@ def compute_ground_score(predict_str: str, ground_truth: str, extra_info=None) -
         "acc": acc_reward,
         "ground_reward": ground_reward,
         "code_error_reward": code_panelty,
+        "tool_reward": tool_reward,
     }
 
 

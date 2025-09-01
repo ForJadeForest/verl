@@ -7,6 +7,9 @@ import re
 import requests
 from openai import OpenAI
 
+Box = list[float]  # [x1, y1, x2, y2]
+
+
 openai_api_key = "EMPTY"
 openai_api_base_list = [
     os.environ.get("LLM_AS_A_JUDGE_BASE", "http://10.39.13.134:18901/v1"),
@@ -28,6 +31,7 @@ for client in client_list:
     response = requests.get(f"{api_base}/models")
     models = response.json()
     model_name_list.append(models["data"][0]["id"])
+
 
 
 def get_chat_template():
@@ -196,20 +200,20 @@ def check_format(predict_str):
     if predict_str.endswith("<|im_end|>"):
         predict_str = predict_str[: -len("<|im_end|>")]
 
-    think_format_pattern = r"^<think>(?s:(?:(?!</think>).)*)</think>\n{1,2}<answer>(?s:(?:(?!</answer>).)*)</answer>\Z"
-    if not re.match(think_format_pattern, predict_str):
-        is_format_error = True
+    # think_format_pattern = r"^<think>(?s:(?:(?!</think>).)*)</think>\n{1,2}<answer>(?s:(?:(?!</answer>).)*)</answer>\Z"
+    # if not re.match(think_format_pattern, predict_str):
+    #     is_format_error = True
 
     count_vision_1 = predict_str.count("<|vision_start|><|image_pad|>")
     count_vision_2 = predict_str.count("<|image_pad|><|vision_end|>")
     if count_vision_1 != count_vision_2:
         is_format_error = True
 
-    think_1 = predict_str.count("<think>")
-    think_2 = predict_str.count("</think>")
+    # think_1 = predict_str.count("<think>")
+    # think_2 = predict_str.count("</think>")
 
-    if think_1 != 1 or think_2 != 1:
-        is_format_error = True
+    # if think_1 != 1 or think_2 != 1:
+    #     is_format_error = True
 
     tool_call_1 = predict_str.count("<tool_call>")
     tool_call_2 = predict_str.count("</tool_call>")
@@ -241,7 +245,7 @@ def check_format(predict_str):
     return is_format_error, give_tool_reward
 
 
-def compute_code_panelty(predict_str: str) -> dict:
+def compute_code_panelty(predict_str: str) -> float:
     code_error_count = predict_str.count("[CODE RUN ERROR]")
     tool_call_num = predict_str.count("<tool_response>")
 
@@ -249,6 +253,74 @@ def compute_code_panelty(predict_str: str) -> dict:
         return - code_error_count / tool_call_num
     else:
         return 0.0
+
+
+def compute_repetition_penalty(predict_str: str) -> float:
+    if "</tool_call><tool_call>" in predict_str:
+        return max(-1, -0.25 * predict_str.count("</tool_call><tool_call>"))
+    else:
+        return 0.0
+    
+
+
+
+def iou(box_a: Box, box_b: Box) -> float:
+    """计算两个矩形框的 IoU。假设输入合法: x1<=x2, y1<=y2"""
+    ax1, ay1, ax2, ay2 = box_a
+    bx1, by1, bx2, by2 = box_b
+
+    inter_x1 = max(ax1, bx1)
+    inter_y1 = max(ay1, by1)
+    inter_x2 = min(ax2, bx2)
+    inter_y2 = min(ay2, by2)
+
+    inter_w = max(0.0, inter_x2 - inter_x1)
+    inter_h = max(0.0, inter_y2 - inter_y1)
+    inter_area = inter_w * inter_h
+
+    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    union = area_a + area_b - inter_area
+    if union <= 0:
+        return 0.0
+    return inter_area / union
+
+def is_valid_box(b: Box) -> bool:
+    """检查 box 合法性 (x1<=x2, y1<=y2)。"""
+    x1, y1, x2, y2 = b
+    return (x1 <= x2) and (y1 <= y2)
+
+def calculate_grounding_reward(pred_bbox: list[Box], gt_bbox: list[Box]) -> tuple[float, float, float, float]:
+    """
+    其中 R_IoU = 0.5*(R_IoU^R + R_IoU^P)
+         R_IoU^R = (1/M) * sum_k max_i IoU( b̂_i, b_k )
+         R_IoU^P = (1/N) * sum_i max_k IoU( b̂_i, b_k )
+
+    规则：
+      - 若 pred_bbox 中任意 box 非法(x1>x2 或 y1>y2)，则整个 reward=0
+    """
+    # 检查合法性
+    if any(not is_valid_box(b) for b in pred_bbox):
+        return 0.0, 0.0, 0.0
+
+    N = len(pred_bbox)
+    M = len(gt_bbox)
+
+    # Recall term
+    if M == 0:
+        R_recall = 0.0
+    else:
+        R_recall = sum(max(iou(p, g) for p in pred_bbox) if pred_bbox else 0.0 for g in gt_bbox) / M
+
+    # Precision term
+    if N == 0:
+        R_precision = 0.0
+    else:
+        R_precision = sum(max(iou(p, g) for g in gt_bbox) if gt_bbox else 0.0 for p in pred_bbox) / N
+
+    R_iou = 0.5 * (R_recall + R_precision)
+    return R_iou, R_recall, R_precision
+
 
 
 def compute_score(predict_str: str, ground_truth: str, extra_info=None) -> dict:
@@ -307,7 +379,8 @@ def compute_score(predict_str: str, ground_truth: str, extra_info=None) -> dict:
 
     format_reward = 0 if is_format_error else 1.0
     code_panelty = compute_code_panelty(predict_str)
-    final_score = 1.0 * acc_reward + 0.25 * format_reward + code_panelty
+    code_repetition_reward = compute_repetition_penalty(predict_str)
+    final_score = 1.0 * acc_reward + 0.25 * format_reward + code_panelty + code_repetition_reward
 
     return {
         "score": final_score,
@@ -315,93 +388,8 @@ def compute_score(predict_str: str, ground_truth: str, extra_info=None) -> dict:
         "acc_reward": acc_reward,
         "acc": acc_reward,
         "code_error_reward": code_panelty,
+        "code_repetition_reward": code_repetition_reward,
     }
-
-
-def rule_math_verify(ground_truth, model_answer):
-    try:
-        # Import here to avoid circular import
-        from math_verify import parse, verify
-
-        # Set parsing_timeout=None to avoid signal.alarm() usage
-        gold = parse(ground_truth, parsing_timeout=None)
-        answer = parse(model_answer, parsing_timeout=None)
-        return verify(gold, answer, timeout_seconds=None)
-    except Exception as e:
-        print(f" [ERROR math] rule_math_verify error: {e}")
-        return False
-
-
-def generative_verify(query, ground_truth, model_answer):
-    client_idx = random.randint(0, len(client_list) - 1)
-    client = client_list[client_idx]
-    model_name = model_name_list[client_idx]
-
-    full_prompt = MATH_VERIFY_PROMPT.format(
-        query=query,
-        gold_ans=ground_truth,
-        pred_ans=model_answer,
-    )
-
-    response = ""
-    for it in range(8):
-        try:
-            chat_response = client.chat.completions.create(
-                model=model_name,
-                messages=[
-                    {"role": "user", "content": full_prompt},
-                ],
-                seed=random.randint(0, 1000000),
-                temperature=0.5,
-            )
-            response = chat_response.choices[0].message.content.strip()
-            break
-        except Exception as e:
-            print(f" [ERROR math] generative_verify error: {e}")
-            continue
-
-    judgement = response.split("## Equivalence Judgement")[-1].lower()
-    if "true" in judgement and "false" not in judgement:
-        return True
-    elif "false" in judgement and "true" not in judgement:
-        return False
-    else:
-        print(" [ERROR math] verify bug output: ")
-    return False
-
-
-def compute_score_math(predict_str: str, ground_truth: str, extra_info=None) -> dict:
-    predict_str = predict_str.strip()
-    is_format_error, give_tool_reward = check_format(predict_str)
-
-    answer_text = extract_answer(predict_str)
-    if not answer_text:
-        is_format_error = True
-        answer_text = predict_str
-
-    answer_text = answer_text.strip()
-
-    if rule_math_verify(ground_truth, answer_text):
-        acc_reward = 1.0
-    else:
-        acc_reward = (
-            1.0
-            if generative_verify(extra_info["question"], ground_truth, answer_text)
-            else 0.0
-        )
-
-    format_reward = 0 if is_format_error else 1.0
-    code_panelty = compute_code_panelty(predict_str)
-    final_score = 1.0 * acc_reward + 0.25 * format_reward + code_panelty
-
-    return {
-        "score": final_score,
-        "format_reward": format_reward,
-        "acc_reward": acc_reward,
-        "acc": acc_reward,
-        "code_error_reward": code_panelty,
-    }
-
 
 def compute_ground_score(predict_str: str, ground_truth: str, extra_info=None) -> dict:
     predict_str = predict_str.strip()
@@ -457,16 +445,6 @@ def compute_ground_score(predict_str: str, ground_truth: str, extra_info=None) -
     if answer_text and len(answer_text) >= 300:
         is_format_error = True
 
-    def is_vaild_bbox(bbox):
-        if not isinstance(bbox, list) and not isinstance(bbox, tuple):
-            return False
-        if len(bbox) != 4:
-            return False
-        if bbox[0] < 0 or bbox[1] < 0 or bbox[2] < 0 or bbox[3] < 0:
-            return False
-        if bbox[0] > bbox[2] or bbox[1] > bbox[3]:
-            return False
-        return True
 
     def extract_bbox(predict_str) -> list[tuple[float, float, float, float]]:
         pattern = r"<box>(.*?)</box>"
@@ -475,86 +453,48 @@ def compute_ground_score(predict_str: str, ground_truth: str, extra_info=None) -
         for match in matches:
             bbox = match.strip()
             bbox = json.loads(bbox)
-            if is_vaild_bbox(bbox):
-                bboxs.append(bbox)
+            bboxs.append(bbox)
         return bboxs
 
     try:
-        bboxs = extract_bbox(predict_str)
+        pred_bboxs = extract_bbox(predict_str)
     except Exception as e:
         print(f" [Extract Bbox ERROR] extract_bbox error: {e}")
-        bboxs = []
-        ground_reward = 0.0
+        pred_bboxs = []
 
     gt_bboxs = extra_info["bbox"]
-    # calculate the iou between bboxs and gt_bboxs
+    if isinstance(gt_bboxs, str):
+        gt_bboxs = json.loads(gt_bboxs)
+        gt_bboxs = [item["bbox"] for item in gt_bboxs]
+    if isinstance(gt_bboxs, list) and not isinstance(gt_bboxs[0], list):
+        gt_bboxs = [gt_bboxs]
 
-    def calculate_iou_single(bbox, gt_bbox, eps=1e-7):
-        input_width = extra_info["resized_width"]
-        input_height = extra_info["resized_height"]
-        original_width = extra_info["ori_width"]
-        original_height = extra_info["ori_height"]
-
-        x1 = int(bbox[0] / input_width * original_width)
-        x2 = int(bbox[2] / input_width * original_width)
-        y1 = int(bbox[1] / input_height * original_height)
-        y2 = int(bbox[3] / input_height * original_height)
-        bbox = (x1, y1, x2, y2)
-
-        # 交集矩形
-        x1 = max(bbox[0], gt_bbox[0])
-        y1 = max(bbox[1], gt_bbox[1])
-        x2 = min(bbox[2], gt_bbox[2])
-        y2 = min(bbox[3], gt_bbox[3])
-
-        iw = max(0.0, x2 - x1)
-        ih = max(0.0, y2 - y1)
-        inter = iw * ih
-
-        # 各自面积
-        w1 = max(0.0, bbox[2] - bbox[0])
-        h1 = max(0.0, bbox[3] - bbox[1])
-        w2 = max(0.0, gt_bbox[2] - gt_bbox[0])
-        h2 = max(0.0, gt_bbox[3] - gt_bbox[1])
-        area1 = w1 * h1
-        area2 = w2 * h2
-
-        # 并集
-        union = area1 + area2 - inter
-        if union <= 0:
-            return 0.0
-        return inter / (union + eps)
-
-    def calculate_iou(bboxs, gt_bboxs):
-        iou = 0.0
-        for bbox in bboxs:
-            iou = max(iou, calculate_iou_single(bbox, gt_bboxs))
-        return iou
-
-    if len(bboxs) >= 6:
+    try:
+        ground_reward, R_recall, R_precision = calculate_grounding_reward(pred_bboxs, gt_bboxs)
+    except Exception as e:
+        print(f" [Calculate Grounding Reward ERROR] calculate_grounding_reward error: {e}")
         ground_reward = 0.0
-    else:
-        try:
-            iou = calculate_iou(bboxs, gt_bboxs)
-            if iou > 0.5:
-                ground_reward = 1.0
-            else:
-                ground_reward = 0.0
-        except Exception as e:
-            print(f" [Calculate IOU ERROR] calculate_iou error: {e}")
-            ground_reward = 0.0
+        R_recall = 0.0
+        R_precision = 0.0
 
     format_reward = 0 if is_format_error else 1.0
     code_panelty = compute_code_panelty(predict_str)
-    final_score = 0.5 * acc_reward + 0.25 * format_reward + 0.5 * ground_reward + code_panelty
+    code_repetition_reward = compute_repetition_penalty(predict_str)
+    if "<answer>" not in predict_str:
+        ground_reward = 0.0
+    
+    final_score = acc_reward + 0.5 * format_reward + ground_reward + code_panelty + code_repetition_reward
     
     return {
         "score": final_score,
         "format_reward": format_reward,
         "acc_reward": acc_reward,
-        "acc": acc_reward,
         "ground_reward": ground_reward,
+        "ground_recall_reward": R_recall,
+        "ground_precision_reward": R_precision,
+        "acc": acc_reward,
         "code_error_reward": code_panelty,
+        "code_repetition_reward": code_repetition_reward,
     }
 
 
@@ -587,9 +527,7 @@ def reward_fn(
     ):
         res = compute_score(solution_str, ground_truth, extra_info)
 
-    elif data_source in ["thinklite_eureka", "xince"]:
-        res = compute_score_math(solution_str, ground_truth, extra_info)
-    elif data_source in ["Ground-R1"]:
+    elif data_source in ["Ground-R1", "TreeVGR-RL"]:
         res = compute_ground_score(solution_str, ground_truth, extra_info)
     elif data_source in ["MathVista", "MathVerse", "HallusionBench", "MMMU", "VStar", "AI2D", "HRBench-4k", "HRBench-8k", "TreeBench", "MMStar"]:
         res = compute_score(solution_str, ground_truth, extra_info)
