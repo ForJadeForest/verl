@@ -49,8 +49,12 @@ class NaiveRewardManager(AbstractRewardManager):
         # If there is rm score, we directly return rm score. Otherwise, we compute via rm_score_fn
         if "rm_scores" in data.batch.keys():
             if return_dict:
-                reward_extra_info = data.meta_info.get("reward_extra_info", {})
-                return {"reward_tensor": data.batch["rm_scores"], "reward_extra_info": reward_extra_info}
+                reward_extra_info = data.non_tensor_batch.get("reward_extra_info", [])
+                reward_extra_info_dict = {k: [] for k in reward_extra_info[0].keys()}
+                for reward_extra_info_item in reward_extra_info:
+                    for key, value in reward_extra_info_item.items():
+                        reward_extra_info_dict[key].append(value)
+                return {"reward_tensor": data.batch["rm_scores"], "reward_extra_info": reward_extra_info_dict}
             else:
                 return data.batch["rm_scores"]
 

@@ -1156,7 +1156,6 @@ class RayPPOTrainer:
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
-                    print(f" [INFO] batch.meta_info: {batch.meta_info}")
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
@@ -1181,7 +1180,6 @@ class RayPPOTrainer:
                             future_reward = compute_reward_async.remote(data=batch, reward_fn=self.reward_fn)
                         else:
                             reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
-                    print(f" [INFO] reward_extra_infos_dict: {reward_extra_infos_dict}")
                     # recompute old_log_probs
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
                         old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
@@ -1363,6 +1361,13 @@ class RayPPOTrainer:
                     for k in reward_keys:
                         reward_tensor = batch.non_tensor_batch[k]
                         valid_reward_tensor = reward_tensor[reward_tensor != reward_mask]
+                        if valid_reward_tensor.size == 0:
+                            # 给默认值或者直接跳过
+                            sub_reward_metrics[f"reward/{k}_mean"] = np.nan
+                            sub_reward_metrics[f"reward/{k}_max"]  = np.nan
+                            sub_reward_metrics[f"reward/{k}_min"]  = np.nan
+                            sub_reward_metrics[f"reward/{k}_std"]  = np.nan
+                            continue
                         sub_reward_metrics[f"reward/{k}_mean"] = np.mean(valid_reward_tensor)
                         sub_reward_metrics[f"reward/{k}_max"] = np.max(valid_reward_tensor)
                         sub_reward_metrics[f"reward/{k}_min"] = np.min(valid_reward_tensor)
