@@ -54,6 +54,7 @@ class MultiTurnConfig(BaseConfig):
     use_inference_chat_template: bool = False
     tokenization_sanity_check_mode: str = "strict"
     format: str = "hermes"
+    single_max_new_tokens: Optional[int] = None  # Changed to None to use response_length as default
 
 
 @dataclass
