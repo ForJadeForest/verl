@@ -14,7 +14,6 @@
 # limitations under the License.
 
 import base64
-import json
 import logging
 import os
 import socket
@@ -32,7 +31,7 @@ import requests
 from PIL import Image
 
 from .base_tool import BaseTool
-from .schemas import OpenAIFunctionToolSchema, ToolResponse
+from .schemas import JupyterToolResponse, OpenAIFunctionToolSchema
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -95,7 +94,7 @@ def encode_pil_image_to_base64(pil_image):
     return img_str
 
 
-def encode_image_base64(image: Union[str, Image.Image]) -> str:
+def encode_image_base64(image: str | Image.Image) -> str:
     """Encode image to base64 string"""
     if isinstance(image, str):
         return encode_image_path_base64(image)
@@ -140,7 +139,7 @@ def base64_to_image(base64_str: str) -> Image.Image:
         raise ValueError(f"Image aspect ratio too extreme: {aspect_ratio:.2f}. Maximum allowed is 200.")
     
     from qwen_vl_utils import fetch_image
-    image = fetch_image({"image": image, "max_pixels": 28 * 28 * 4096 * 2})
+    image = fetch_image({"image": image, "max_pixels": 28 * 28 * 512})
 
     return image
 
@@ -173,9 +172,9 @@ def run_jupyter_code(cell_list, sandbox_url, upload_file_dict=None, max_retries=
                     "cells": cell_list,
                     "kernel": "python3",
                     "files": upload_file_dict,
-                    "total_timeout": 20,
+                    "total_timeout": 15,
                 },
-                timeout=22,  # Add request timeout
+                timeout=16,  # Add request timeout
             )
             response.raise_for_status()  # Raise exception for HTTP errors
             
@@ -222,7 +221,10 @@ def parse_cell_output(cell_output: dict) -> dict:
         # traceback = e.get("traceback", "")
         e_name = e.get("ename", "")
         e_value = e.get("evalue", "")
-        error_message = f"[CODE RUN ERROR]: {e_name} - {e_value}\n\nPlease read the bug information and fix it to continue solve the question. Hint: All variables in this cell can not be used in the next cell."
+        error_message = f"[CODE RUN ERROR]: {e_name} - {e_value}\n\n"
+        error_message += "Please read the bug information and fix it to continue solve the question."
+        error_message += "Hint: All variables in this cell can not be used in the next cell."
+
         if len(error_message) > 3000:
             error_message = error_message[:1500] + "..." + error_message[-1500:]
     # show display output
@@ -274,6 +276,9 @@ def cell_output_to_str(cell_output: dict) -> dict:
                     continue
             error_info_text = "\n".join(error_infos)
             if valid_images:
+                if len(valid_images) > 2:
+                    valid_images = valid_images[:2]
+                    text_output += "\nWarning: Only can show 2 images, the rest of the images are not shown."
                 return {
                     "text": text_output,
                     "images": valid_images,
@@ -393,7 +398,7 @@ class JupyterTool(BaseTool):
         _tool_schema = OpenAIFunctionToolSchema.model_validate({
             "type": "function",
             "function": {
-                "name": "excute_python_code_in_jupyter",
+                "name": "execute_python_code_in_jupyter",
                 "description": (
                     "Execute Python code in a persistent Jupyter environment to solve a wide variety of problems. "
                     "This powerful tool runs code and returns results and error information."
@@ -444,7 +449,7 @@ class JupyterTool(BaseTool):
     def get_openai_tool_schema(self) -> OpenAIFunctionToolSchema:
         return self.tool_schema
 
-    async def create(self, instance_id: Optional[str] = None, **kwargs) -> tuple[str, ToolResponse]:
+    async def create(self, instance_id: Optional[str] = None, **kwargs) -> tuple[str, JupyterToolResponse]:
         """
         Creates a new instance for Jupyter tool.
 
@@ -476,7 +481,6 @@ class JupyterTool(BaseTool):
 
         # Initialize instance data
         instance_data = {
-            "code_list": [],
             "upload_file_dict": {},
             "response": "",
             "reward": 0.0,
@@ -493,15 +497,18 @@ class JupyterTool(BaseTool):
     
         
         self._instance_dict[instance_id] = instance_data
-        return instance_id, ToolResponse()
+        return instance_id, JupyterToolResponse()
 
-    async def execute(self, instance_id: str, parameters: dict[str, Any], **kwargs) -> tuple[ToolResponse, float, dict]:
+    async def execute(self, instance_id: str, parameters: dict[str, Any], **kwargs) -> tuple[JupyterToolResponse, float, dict]:
         """Execute Python code in Jupyter environment."""
         code = parameters.get("code")
+        code_list = parameters.get("code_list", [])
 
         if not code or not isinstance(code, str):
             return (
-                ToolResponse(text="Error: 'code' parameter is missing or not a string."),
+                JupyterToolResponse(
+                    text="Error: 'code' parameter is missing or not a string.", 
+                    cell_code=code),
                 -0.05,
                 {"success": False},
             )
@@ -509,20 +516,21 @@ class JupyterTool(BaseTool):
         code = code.strip()
         if not code:
             return (
-                ToolResponse(text="Error: 'code' parameter is empty."),
+                JupyterToolResponse(
+                    text="Error: 'code' parameter is empty.", 
+                    cell_code=code),
                 -0.05,
                 {"success": False},
             )
 
         instance_data = self._instance_dict[instance_id]
-        instance_data["code_list"].append(code)
-
         try:
+            code_list.append(code)
             # Execute the code using the execution pool
             cell_out = ray.get(
                 self.execution_pool.execute.remote(
                     run_jupyter_code,
-                    instance_data["code_list"],
+                    code_list,
                     self.sandbox_url,
                     instance_data["upload_file_dict"],
                 )
@@ -545,7 +553,10 @@ class JupyterTool(BaseTool):
                 success = True
 
             # Create tool response
-            tool_response = ToolResponse(text=response_text)
+            tool_response = JupyterToolResponse(
+                text=response_text,
+                cell_code=code,
+            )
             if response_images:
                 tool_response.image = response_images
 
@@ -558,7 +569,10 @@ class JupyterTool(BaseTool):
         except Exception as e:
             logger.error(f"Error executing Jupyter code: {e}")
             return (
-                ToolResponse(text=f"Error executing Python code: {e}"),
+                JupyterToolResponse(
+                    text=f"Error executing Python code: {e}",
+                    cell_code=code,
+                ),
                 -0.05,
                 {"success": False, "error": str(e)},
             )

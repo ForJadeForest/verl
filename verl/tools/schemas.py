@@ -118,3 +118,7 @@ class ToolResponse(BaseModel):
 
     def is_empty(self) -> bool:
         return self.text is None and self.image is None and self.video is None
+
+
+class JupyterToolResponse(ToolResponse):
+    cell_code: str | None = None
