@@ -16,9 +16,6 @@ from PIL import Image
 from tqdm import tqdm
 
 from evaluate.infer_engine_utils import (
-    IMAGE_FACTOR,
-    MAX_PIXELS,
-    MIN_PIXELS,
     build_user_message_for_gen,
     extract_answer,
     extract_response,
@@ -158,9 +155,7 @@ async def process_one_item(
                 raise
         pil_img = qwen_resize_image(
             pil_img,
-            factor=IMAGE_FACTOR,
-            min_pixels=MIN_PIXELS,
-            max_pixels=MAX_PIXELS,
+            max_pixels=8192 * 28 * 28 * 2,
         )
         base64_image = encode_image_base64(pil_img)
 
@@ -189,9 +184,9 @@ async def process_one_item(
         "temperature": 0.0,
         "max_tokens": 10240,
         "top_p": 1.0,
-        "extra_body": {
-            "repetition_penalty": 1.05 if args.use_code_tool else 1.0,
-        },
+        # "extra_body": {
+        #     "repetition_penalty": 1.05 if args.use_code_tool else 1.0,
+        # },
     }
 
     output_messages = []
@@ -334,19 +329,22 @@ async def main():
             sandbox_url=args.sandbox_url,
         )
 
-    tasks = [asyncio.create_task(_task(ds[i])) for i in range(len(ds))]
-
-    for coro in asyncio.as_completed(tasks):
-        res, acc_int = await coro
-        # Separate raw messages for compatibility
-        raw_messages_to_write.append(res.get("messages", []))
-        res.pop("messages", None)
-        results_to_write.append(res)
-        processed += 1
-        correct_count += acc_int
-        cur_acc = (correct_count / processed) * 100.0 if processed else 0.0
-        pbar.set_postfix(accuracy=f"{cur_acc:.2f}%")
-        pbar.update(1)
+    # 分批提交任务，避免一次性创建全部协程导致内存和调度压力
+    total = len(ds)
+    for start in range(0, total, args.num_workers):
+        batch_indices = range(start, min(start + args.num_workers, total))
+        tasks = [asyncio.create_task(_task(ds[i])) for i in batch_indices]
+        for coro in asyncio.as_completed(tasks):
+            res, acc_int = await coro
+            # Separate raw messages for compatibility
+            raw_messages_to_write.append(res.get("messages", []))
+            res.pop("messages", None)
+            results_to_write.append(res)
+            processed += 1
+            correct_count += acc_int
+            cur_acc = (correct_count / processed) * 100.0 if processed else 0.0
+            pbar.set_postfix(accuracy=f"{cur_acc:.2f}%")
+            pbar.update(1)
 
     pbar.close()
 

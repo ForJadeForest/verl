@@ -1,8 +1,12 @@
+import base64
 import json
 import re
+import time
+from io import BytesIO
 
 import requests
 from openai import AsyncOpenAI
+from PIL import Image
 
 IMAGE_FACTOR = 28
 MIN_PIXELS = 4 * 28 * 28
@@ -35,20 +39,36 @@ Please answer in the following format:
 
 
 def run_jupyter_code(cell_list, sandbox_url, upload_file_dict=None):
-    response = requests.post(
-        f"{sandbox_url}/run_jupyter",
-        json={
-            "cells": cell_list,
-            "kernel": "python3",
-            "files": upload_file_dict,
-            "total_timeout": 22,
-        },
-    )
-    output_cells = response.json().get("cells", [])
-    if not output_cells:
-        raise ValueError(f"No output cells returned from Jupyter execution. Cell List: {cell_list}")
+    attempts = 3
+    last_err = None
+    for attempt in range(1, attempts + 1):
+        try:
+            response = requests.post(
+                f"{sandbox_url}/run_jupyter",
+                json={
+                    "cells": cell_list,
+                    "kernel": "python3",
+                    "files": upload_file_dict,
+                    "total_timeout": 22,
+                },
+            )
+            try:
+                data = response.json()
+            except Exception as e:
+                data = {}
+                last_err = f"invalid_json_attempt_{attempt}: {e}"
 
-    return output_cells
+            output_cells = data.get("cells", []) if isinstance(data, dict) else []
+            if output_cells:
+                return output_cells
+            last_err = f"no_output_cells_attempt_{attempt}"
+        except Exception as e:
+            last_err = f"request_error_attempt_{attempt}: {e}"
+        if attempt < attempts:
+            time.sleep(0.5)
+
+    return None
+
 
 
 
@@ -68,7 +88,10 @@ def parse_cell_output(cell_output: dict) -> dict:
         # traceback = e.get("traceback", "")
         e_name = e.get("ename", "")
         e_value = e.get("evalue", "")
-        error_message = f"[CODE RUN ERROR]: {e_name} - {e_value}\n\nPlease read the bug information and fix it to continue solve the question. Hint: All variables in this cell can not be used in the next cell."
+        error_message = f"[CODE RUN ERROR]: {e_name} - {e_value}\n\n"
+        error_message += "Please read the bug information and fix it to continue solve the question."
+        error_message += "Hint: All variables in this cell can not be used in the next cell."
+
         if len(error_message) > 3000:
             error_message = error_message[:1500] + "..." + error_message[-1500:]
     # show display output
@@ -100,17 +123,50 @@ def parse_cell_output(cell_output: dict) -> dict:
         "has_error": bool(error_message),
     }
 
+def process_image_output(image_output: list[str]) -> list:
+    from evaluate.utils import encode_image_base64
+    
+    # 修复变量名冲突
+    decoded_images = [base64.b64decode(image.split(",", 1)[-1]) for image in image_output]
+    pil_images = [Image.open(BytesIO(img_data)).convert("RGB") for img_data in decoded_images]
+    
+    def check_image_size(image: Image.Image) -> str:  # 修正返回类型
+        width, height = image.size
+        if width < 28 or height < 28:
+            print(f"Image size {width}x{height} is smaller than 28, attempting resize.")
+            
+            # 计算resize比例，使最小边达到28像素
+            min_dim = min(width, height)
+            if min_dim == 0:  # 防止除零错误
+                raise ValueError(f"Image has zero dimension: {width}x{height}")
+            
+            ratio = 28.0 / min_dim
+            new_width = int(width * ratio)
+            new_height = int(height * ratio)
+            
+            # 使用LANCZOS重采样进行resize（高质量）
+            image = image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+            print(f"Resized image from {width}x{height} to {new_width}x{new_height}")
+        
+        # 编码图像并返回
+        encoded_image = f"data:image/jpeg;base64,{encode_image_base64(image)}"
+        return encoded_image
+    
+    processed_images = [check_image_size(image) for image in pil_images]
+    return processed_images
+
 def cell_output_to_content_list(cell_output: dict) -> list:
     text_output = cell_output["text_output"]
     image_output = cell_output["image_output"]
     content = [
-        {"type": "text", "text": "<tool_response><interpreter>" + text_output},
+        {"type": "text", "text": "<tool_response>\n<interpreter>" + text_output},
     ]
+    image_output = process_image_output(image_output)
     for image in image_output:
         content.append(
             {"type": "image_url", "image_url": {"url": image}}  # type: ignore
         )
-    content.append({"type": "text", "text": "</interpreter></tool_response>"})
+    content.append({"type": "text", "text": "</interpreter>\n</tool_response>"})
     return content
 
 def extract_code_from_response(response_text: str) -> str:
@@ -143,15 +199,14 @@ def call_tool(
     try:
         code_output = run_jupyter_code(code_list, sandbox_url, upload_file_dict=upload_file_dict)
     except Exception as e:
-        
-        raise e
+        print("Call Tool Error: ", e)
         return {"status": "error", "message": "Tool Call Jupyter Runing Error: " + str(e)}
+    if code_output is None:
+        print("Call Tool Error: No output cells returned from Jupyter execution")
+        return {"status": "error", "message": "Tool Call Jupyter Runing Error: No output cells returned from Jupyter execution"}
 
-    try:
-        parsed_output = parse_cell_output(code_output[-1])
-        code_output_content_list = cell_output_to_content_list(parsed_output)
-    except Exception as e:
-        return {"status": "error", "message": "Parse Cell Output Error: " + str(e)}
+    parsed_output = parse_cell_output(code_output[-1])
+    code_output_content_list = cell_output_to_content_list(parsed_output)
 
     return {
         "status": "success",
@@ -190,6 +245,7 @@ async def solve_one_query(
         if "<tool_call>" in response_text and "</tool_call>" in response_text:
             tool_out = call_tool(response_text, code_list, upload_image_dict, sandbox_url)
             if tool_out["status"] == "error":
+                print("Tool Call Error: ", tool_out["message"])
                 message.extend(
                     [
                         {"role": "assistant", "content": response_text},
@@ -209,7 +265,7 @@ async def solve_one_query(
                     ]
                 )
 
-            if response_num == max_turn - 1:
+            if response_num == max_turn - 2:
                 if isinstance(message[-1]["content"], list):
                     message[-1]["content"].append(
                         {
@@ -242,10 +298,10 @@ def extract_response(messages: list[dict]) -> str:
     assistant_begin = False
     for m in messages:
         # find the first assistant message
+        if not assistant_begin and m['role'] == "assistant":
+            assistant_begin = True
         if not assistant_begin:
             continue
-        if m['role'] == "assistant":
-            assistant_begin = True
 
         content = m.get("content", "")
         if isinstance(content, str):
@@ -259,7 +315,7 @@ def extract_response(messages: list[dict]) -> str:
     return response
 
 def extract_answer(response: str) -> str:
-    search_result = re.search(r"<answer>(.*)</answer>", response)
+    search_result = re.search(r"<answer>(.*)</answer>", response, re.DOTALL)
     if search_result:
         response = search_result.group(1)
     else:

@@ -16,9 +16,6 @@ from PIL import Image
 from tqdm import tqdm
 
 from evaluate.infer_engine_utils import (
-    IMAGE_FACTOR,
-    MAX_PIXELS,
-    MIN_PIXELS,
     build_user_message_for_gen,
     extract_answer,
     extract_response,
@@ -174,6 +171,7 @@ async def process_one_item(
     use_code_tool: bool,
     semaphore: asyncio.Semaphore,
     sandbox_url: str,
+    tname: str,
 ):
     """
     返回：
@@ -194,12 +192,10 @@ async def process_one_item(
 
     # 处理图片
     pil_img = Image.open(img_path)
-    if args.pre_resize:
+    if args.pre_resize and tname == "relative_position":
         pil_img = qwen_resize_image(
             pil_img,
-            factor=IMAGE_FACTOR,
-            min_pixels=MIN_PIXELS,
-            max_pixels=MAX_PIXELS,
+            max_pixels=8192 * 28 * 28 * 2,
         )
     base64_image = encode_image_base64(pil_img)
 
@@ -234,14 +230,13 @@ async def process_one_item(
         "temperature": 0.,
         "max_tokens": 10240,
         "top_p": 1.0,
-        "extra_body": {
-            "repetition_penalty": 1.05 if use_code_tool else 1.0,
-        },
+        # "extra_body": {
+        #     "repetition_penalty": 1.05 if use_code_tool else 1.0,
+        # },
     }
 
     async with semaphore:
         if use_code_tool:
-            # 走你的多轮 + sandbox 引擎
             output_messages = await solve_one_query(
                 messages,
                 upload_image_dict,
@@ -251,7 +246,6 @@ async def process_one_item(
                 max_turn=10,
                 gen_kwargs=gen_kwargs,
             )
-
             response = extract_response(output_messages)
 
         else:
@@ -286,6 +280,7 @@ async def process_one_item(
             acc_reward = 1.0 if "1" in jtxt else 0.0
         except Exception as e:
             # 判题失败按错误处理为错误（保守）
+            print("Judge Error: ", e)
             acc_reward = 0.0
             status = f"{status} | JudgeError: {e}"
 
@@ -360,20 +355,27 @@ async def process_one_type(
             use_code_tool=use_code_tool,
             semaphore=semaphore,
             sandbox_url=sandbox_url,
+            tname=type_name,
         )
 
-    tasks = [asyncio.create_task(_task(img)) for img in image_files]
-
-    # 结果随完成写盘 + 更新准确率
-    for coro in asyncio.as_completed(tasks):
-        res, acc_int = await coro
-        results_to_write.append(res)
-        raw_messages_to_write.append(res.pop("messages", []))  # 与原一致：消息独立保存
-        processed += 1
-        correct_count += acc_int
-        cur_acc = (correct_count / processed) * 100.0 if processed else 0.0
-        pbar.set_postfix(accuracy=f"{cur_acc:.2f}%")
-        pbar.update(1)
+    # 分批提交任务，避免一次性创建全部协程导致内存和调度压力
+    for start in range(0, total, max_concurrency):
+        batch = image_files[start : start + max_concurrency]
+        tasks = [asyncio.create_task(_task(img)) for img in batch]
+        for coro in asyncio.as_completed(tasks):
+            res, acc_int = await coro
+            results_to_write.append(res)
+            raw_message = {
+                "messages": res.pop("messages", []),
+                "acc": acc_int,
+                "answer": res.get("answer", ""),
+            }
+            raw_messages_to_write.append(raw_message)  # 与原一致：消息独立保存
+            processed += 1
+            correct_count += acc_int
+            cur_acc = (correct_count / processed) * 100.0 if processed else 0.0
+            pbar.set_postfix(accuracy=f"{cur_acc:.2f}%")
+            pbar.update(1)
 
     pbar.close()
     os.makedirs(save_dir, exist_ok=True)
@@ -459,7 +461,7 @@ async def main():
         else os.path.join(
             save_root,
             f"{eval_model_name.replace('/', '_')}_{'use_code' if args.use_code_tool else 'no_code'}_judge-{judge_model_name.replace('/', '_')}",
-            time.strftime("%Y%m%d_%H%M"),
+            time_str,
         )
     )
     os.makedirs(final_out_dir, exist_ok=True)

@@ -7,7 +7,6 @@ import sys
 import time
 import uuid
 from io import BytesIO
-from typing import Any
 
 import pandas as pd
 from openai import AsyncOpenAI as OpenAIClient
@@ -15,9 +14,13 @@ from PIL import Image
 from tqdm import tqdm
 
 from evaluate.infer_engine_utils import (
+    build_user_message_for_gen,
+    extract_answer,
+    extract_response,
     solve_one_query,  # code tool 推理引擎（多轮+沙箱）
 )
 from evaluate.prompt import get_system_prompt, query_template
+from evaluate.utils import encode_image_base64, qwen_resize_image
 
 # --------------------------
 # 参数解析
@@ -34,28 +37,6 @@ parser.add_argument("--num_workers", type=int, default=12, help="并发度（异
 parser.add_argument("--pre_resize", action="store_true", help="预先resize图片")
 args = parser.parse_args()
 time_str = time.strftime("%Y%m%d_%H%M")
-
-
-def encode_image_path_base64(image_path):
-    with open(image_path, "rb") as image_file:
-        return base64.b64encode(image_file.read()).decode("utf-8")
-
-
-def encode_pil_image_to_base64(pil_image):
-    buffered = BytesIO()
-    pil_image.save(buffered, format="PNG")
-    img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
-    return img_str
-
-
-def encode_image_base64(image: str | Image.Image) -> str:
-    """Encode image to base64 string"""
-    if isinstance(image, str):
-        return encode_image_path_base64(image)
-    elif isinstance(image, Image.Image):
-        return encode_pil_image_to_base64(image)
-    else:
-        raise ValueError("Image must be a file path or PIL Image instance")
 
 
 # --------------------------
@@ -149,26 +130,6 @@ def build_client(api_url: str):
     )
 
 
-# --------------------------
-# 工具函数
-# --------------------------
-def extract_response(messages: list[dict[str, Any]]) -> str:
-    # 与原实现一致：丢掉前两条（system + user），拼接 assistant 的文本内容
-    response = ""
-    msgs = messages[2:]
-    for m in msgs:
-        content = m.get("content", "")
-        if isinstance(content, str):
-            response += content
-        elif isinstance(content, list):
-            for c in content:
-                if c.get("type") == "text":
-                    response += c.get("text", "")
-                elif c.get("type") == "image_url":
-                    response += "<IMAGE>"
-    return response
-
-
 def rule_judge(pred_ans: str, standard_answer: str) -> float:
     """
     规则判定（与HRBench原判题逻辑保持一致）：
@@ -198,35 +159,6 @@ def rule_judge(pred_ans: str, standard_answer: str) -> float:
     return -1.0
 
 
-def build_user_message_for_gen(
-    base64_images: str | list[str], 
-    question_text: str
-) -> list[dict[str, Any]]:
-    # 统一成列表并复制，避免修改调用方的原始列表
-    images = [base64_images] if isinstance(base64_images, str) else list(base64_images)
-
-    parts = question_text.split("<image>")
-    assert len(images) == len(parts) - 1, (
-        "The number of images and the number of <image> tags in the question text must be the same"
-        f"images: {len(images)}, parts: {len(parts)}"
-    )
-
-    content: list[dict[str, Any]] = []
-    for i, part in enumerate(parts):
-        if part:  # 保留空段行为：如果连续 <image>，就只插图，不插文本
-            content.append({"type": "text", "text": part})
-        if i < len(images):  # 只在段与段之间插入对应图片（不会误给最后一段再塞一张）
-            img = images[i]
-            content.append({
-                "type": "image_url",
-                "image_url": {"url": f"data:image/jpeg;base64,{img}"},
-            })
-    return content
-
-
-# --------------------------
-# 单样本处理（生成 + 判题）
-# --------------------------
 async def process_one_item(
     eval_client,
     judge_client,
@@ -249,13 +181,10 @@ async def process_one_item(
     category = df_row["category"]
 
     # 处理图片
-    from evaluate.utils import IMAGE_FACTOR, MAX_PIXELS, MIN_PIXELS, qwen_resize_image
     if args.pre_resize:
         pil_img = qwen_resize_image(
             Image.open(BytesIO(base64.b64decode(img_base64))),
-            factor=IMAGE_FACTOR,
-            min_pixels=MIN_PIXELS,
-            max_pixels=MAX_PIXELS,
+            max_pixels=8192 * 28 * 28 * 2,
         )
         img_base64 = encode_image_base64(pil_img)
 
@@ -274,14 +203,14 @@ async def process_one_item(
         system_message = get_system_prompt()
         image_uuid = str(uuid.uuid4())
         upload_img_paths = f"./{image_uuid}.jpg"
-        upload_image_dict = {upload_img_paths: base64_image}
         question = INSTRUCTION_PROMPT_BEFORE.format(question=question, options=option_str)
         user_text = query_template(question, upload_img_paths)
+        upload_image_dict = {upload_img_paths: base64_image}
         user_content = build_user_message_for_gen(base64_image, user_text)
     else:
         system_message = "You are a helpful assistant."
+        question = "<image>" + question
         user_text = INSTRUCTION_PROMPT_BEFORE.format(question=question, options=option_str)
-        user_text = "<image>\n" + user_text
         user_content = build_user_message_for_gen(base64_image, user_text)
         upload_image_dict = None  # 不使用 code tool 时无需这个
 
@@ -300,39 +229,32 @@ async def process_one_item(
         "temperature": 0.0,
         "max_tokens": 10240,
         "top_p": 1.0,
-        "extra_body": {
-            "repetition_penalty": 1.05 if use_code_tool else 1.0,
-        },
+        # "extra_body": {
+        #     "repetition_penalty": 1.05 if use_code_tool else 1.0,
+        # },
     }
 
     async with semaphore:
-        try:
-            if use_code_tool:
-                # 走你的多轮 + sandbox 引擎
-                output_messages = await solve_one_query(
-                    messages,
-                    upload_image_dict,
-                    eval_client,
-                    eval_model_name,
-                    sandbox_url,
-                    max_turn=10,
-                    gen_kwargs=gen_kwargs,
-                )
-
-                pred_output = extract_response(output_messages)
-            else:
-                resp = await eval_client.chat.completions.create(
-                    model=eval_model_name,
-                    messages=messages,
-                    **gen_kwargs,
-                )
-
-                pred_output = resp.choices[0].message.content
-                output_messages.append({"role": "assistant", "content": pred_output})
-        except Exception as e:
-            status = f"Error: {e}"
-            pred_output = "ERROR"
-            output_messages = [{"role": "assistant", "content": str(e)}]
+        if use_code_tool:
+            output_messages = await solve_one_query(
+                messages,
+                upload_image_dict,
+                eval_client,
+                eval_model_name,
+                sandbox_url,
+                max_turn=10,
+                gen_kwargs=gen_kwargs,
+            )
+            response = extract_response(output_messages)
+        else:
+            resp = await eval_client.chat.completions.create(
+                model=eval_model_name,
+                messages=messages,
+                **gen_kwargs,
+            )
+            response = resp.choices[0].message.content
+            output_messages.append({"role": "assistant", "content": response})
+    pred_output = extract_answer(response)
 
     # ========== 判题（先规则，必要时LLM） ==========
     acc_reward = rule_judge(pred_output, answer)
@@ -365,10 +287,12 @@ async def process_one_item(
         "answer": answer,
         "answer_str": answer_str,
         "pred_output": pred_output,
+        "response": response,
         "messages": output_messages,
         "status": status,
         "category": category,
         "acc": float(acc_reward),
+        "user_text": user_text,
     }
     return save_info, int(acc_reward)
 
@@ -400,7 +324,7 @@ async def process_one_type(
     save_dir = os.path.join(
         save_root,
         f"{model_name_safe}_{code_tool_suffix}_judge-{judge_model_name_safe}",
-        time.strftime("%Y%m%d_%H%M"),
+        time_str,
     )
 
     # 与原脚本兼容的两个文件
@@ -431,18 +355,19 @@ async def process_one_type(
             sandbox_url=sandbox_url,
         )
 
-    tasks = [asyncio.create_task(_task(idx)) for idx in range(total)]
-
-    # 结果随完成写盘 + 更新准确率
-    for coro in asyncio.as_completed(tasks):
-        res, acc_int = await coro
-        results_to_write.append(res)
-        raw_messages_to_write.append(res.pop("messages", []))  # 与原一致：消息独立保存
-        processed += 1
-        correct_count += acc_int
-        cur_acc = (correct_count / processed) * 100.0 if processed else 0.0
-        pbar.set_postfix(accuracy=f"{cur_acc:.2f}%")
-        pbar.update(1)
+    # 分批提交任务，避免一次性创建全部协程导致内存和调度压力
+    for start in range(0, total, max_concurrency):
+        batch_idx = list(range(start, min(start + max_concurrency, total)))
+        tasks = [asyncio.create_task(_task(idx)) for idx in batch_idx]
+        for coro in asyncio.as_completed(tasks):
+            res, acc_int = await coro
+            results_to_write.append(res)
+            raw_messages_to_write.append(res.pop("messages", []))  # 与原一致：消息独立保存
+            processed += 1
+            correct_count += acc_int
+            cur_acc = (correct_count / processed) * 100.0 if processed else 0.0
+            pbar.set_postfix(accuracy=f"{cur_acc:.2f}%")
+            pbar.update(1)
 
     pbar.close()
     os.makedirs(save_dir, exist_ok=True)
