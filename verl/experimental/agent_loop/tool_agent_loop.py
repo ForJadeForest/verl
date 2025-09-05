@@ -19,6 +19,8 @@ import os
 from typing import Any
 from uuid import uuid4
 
+import torch
+
 from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopOutput, register
 from verl.experimental.agent_loop.tool_parser import FunctionCall, ToolParser
 from verl.tools.schemas import JupyterToolResponse, ToolResponse
@@ -28,6 +30,22 @@ from verl.utils.rollout_trace import rollout_trace_op
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+def filter_invalid_token(token_ids: list[int], tokenizer, log_probs: None | list[float]):
+
+    max_token_id = max(tokenizer.get_vocab().values())
+    max_token_id = max(len(tokenizer), max_token_id)
+    valid_token_pos = [i for i in range(len(token_ids)) if token_ids[i] <= max_token_id]
+    valid_token_ids = [token_ids[i] for i in valid_token_pos]
+    
+    valid_log_probs = None
+    if log_probs is not None:
+        valid_log_probs = [log_probs[i] for i in valid_token_pos]
+    if len(valid_token_ids) != len(token_ids):
+        print(f" [ERROR] filter_invalid_token: {len(token_ids) - len(valid_token_ids)} invalid tokens")
+
+    return valid_token_ids, valid_log_probs
 
 
 @register("tool_agent")
@@ -103,12 +121,13 @@ class ToolAgentLoop(AgentLoopBase):
                 output = await self.server_manager.generate(
                     request_id=request_id, prompt_ids=prompt_ids, sampling_params=sampling_params, image_data=image_data
                 )
-            response_ids = output.token_ids
+            response_ids, log_probs = filter_invalid_token(output.token_ids, self.tokenizer, output.log_probs)
             prompt_ids += response_ids
-            print(f" [INFO {request_id}]: Generated {len(response_ids)} tokens")
+            if len(response_ids) >= 1560:
+                print(f" [INFO {request_id}]: Generated {len(response_ids)} tokens")
             response_mask += [1] * len(response_ids)
             if output.log_probs:
-                response_logprobs += output.log_probs
+                response_logprobs += log_probs
             assistant_turns += 1
 
             # reach max response length
@@ -163,7 +182,10 @@ class ToolAgentLoop(AgentLoopBase):
                     message = {"role": "tool", "content": content}
                 else:
                     # Text-only content
-                    message = {"role": "tool", "content": tool_response.text or ""}
+                    tool_res_text = tool_response.text or ""
+                    if assistant_turns == self.max_assistant_turns - 1:
+                        tool_res_text += "You have reached the maximum number of calling tools. Please give your final answer."
+                    message = {"role": "tool", "content": tool_res_text}
 
                 tool_messages.append(message)
 
@@ -182,14 +204,6 @@ class ToolAgentLoop(AgentLoopBase):
                     raise NotImplementedError(
                         "Multimedia type 'video' is not currently supported. Only 'image' is supported."
                     )
-
-
-            if assistant_turns == self.max_assistant_turns - 1:
-                tool_messages.append({
-                    "role": "user", 
-                    "content": "You have reached the maximum number of calling tools. Please give your final answer."
-                })
-    
             # append tool_response_ids
             if self.processor is not None:
                 raw_tool_response = await self.loop.run_in_executor(
