@@ -7,10 +7,9 @@ import re
 import sys
 import time
 import uuid
-from io import BytesIO
-from typing import Any
+from pathlib import Path
 
-# OpenAI 兼容客户端（优先异步）
+from datasets import Dataset, load_dataset
 from openai import AsyncOpenAI as OpenAIClient
 from PIL import Image
 from tqdm import tqdm
@@ -45,10 +44,6 @@ time_str = time.strftime("%Y%m%d_%H%M")
 # 常量与模板
 # --------------------------
 TEST_TYPES = ["direct_attributes", "relative_position"]
-ABC_MAP = {1: "A", 2: "B", 3: "C", 4: "D", 5: "E", 6: "F"}
-
-INSTRUCTION_PROMPT_BEFORE = """Question: {question}
-Options: {options}""".strip()
 
 
 # 判题 few-shot
@@ -158,41 +153,39 @@ def rule_judge(pred_ans: str, standard_answer_with_prefix: str) -> float:
     return -1.0
 
 
-# --------------------------
-# 单样本处理（生成 + 判题）
-# --------------------------
+def extract_option_text(text, label):
+    # 提取所有 (X) content
+    pattern = r"\(([A-D])\)\s*([^\n]+)"
+    matches = re.findall(pattern, text)
+    options = {letter: content.strip() for letter, content in matches}
+    return "{letter}. {content}".format(letter=label, content=options[label])
+
+
 async def process_one_item(
     eval_client,
     judge_client,
     eval_model_name: str,
     judge_model_name: str,
-    test_path: str,
-    img_name: str,
+    item: dict,
+    vstar_bench_path: str,
     use_code_tool: bool,
     semaphore: asyncio.Semaphore,
     sandbox_url: str,
-    tname: str,
 ):
     """
     返回：
       result_dict, per_item_acc(0/1), test_type
     """
-    img_path = os.path.join(test_path, img_name)
-    anno_path = os.path.join(test_path, img_name.replace(".jpg", ".json"))
-    with open(anno_path) as f:
-        anno = json.load(f)
+    image_path = item['image']
+    img_path = os.path.join(vstar_bench_path, image_path)
+    question = item['text'].replace("Answer with the option's letter from the given choices directly.", "").strip()
 
-    question = anno["question"]
-    options = anno["options"]
-    standard_answer = anno["options"][0]  # A 选项为标准答案
-    standard_answer_with_prefix = "A. " + standard_answer
-
-    # 选项字符串
-    option_str = "\n" + "\n".join(f"{ABC_MAP[i + 1]}. {opt}" for i, opt in enumerate(options))
+    standard_answer = item['label']
+    standard_answer_with_prefix = extract_option_text(question, standard_answer)
 
     # 处理图片
     pil_img = Image.open(img_path)
-    if args.pre_resize and tname == "relative_position":
+    if args.pre_resize:
         pil_img = qwen_resize_image(
             pil_img,
             max_pixels=8192 * 28 * 28 * 2,
@@ -204,14 +197,12 @@ async def process_one_item(
         system_message = get_system_prompt()
         image_uuid = str(uuid.uuid4())
         upload_img_paths = f"./{image_uuid}.jpg"
-        question = INSTRUCTION_PROMPT_BEFORE.format(question=question, options=option_str)
         user_text = query_template(question, upload_img_paths)
         upload_image_dict = {upload_img_paths: base64_image}
         user_content = build_user_message_for_gen(base64_image, user_text)
     else:
         system_message = "You are a helpful assistant."
-        question = "<image>" + question
-        user_text = INSTRUCTION_PROMPT_BEFORE.format(question=question, options=option_str)
+        user_text = "<image>" + question
         user_content = build_user_message_for_gen(base64_image, user_text)
         upload_image_dict = None  # 不使用 code tool 时无需这个
 
@@ -274,21 +265,18 @@ async def process_one_item(
                 temperature=0.0,
             )
             jtxt = jresp.choices[0].message.content.strip()
-            # 兼容两种输出风格
             if "Judgement:" in jtxt:
                 jtxt = jtxt.split("Judgement:")[-1].strip()
             acc_reward = 1.0 if "1" in jtxt else 0.0
         except Exception as e:
-            # 判题失败按错误处理为错误（保守）
             print("Judge Error: ", e)
             acc_reward = 0.0
             status = f"{status} | JudgeError: {e}"
 
-    # 保存单条
     save_info = {
-        "image": img_name,
+        "image": image_path,
         "question": question,
-        "answer": standard_answer,
+        "answer": standard_answer_with_prefix,
         "pred_output": pred_output,
         "response": response,
         "messages": output_messages,
@@ -307,16 +295,15 @@ async def process_one_type(
     judge_client,
     eval_model_name: str,
     judge_model_name: str,
-    type_name: str,
+    task_ds: Dataset,
     vstar_bench_path: str,
+    type_name: str,
     save_root: str,
     use_code_tool: bool,
     max_concurrency: int,
     sandbox_url: str,
 ):
-    test_path = os.path.join(vstar_bench_path, type_name)
-    image_files = [f for f in os.listdir(test_path) if f.lower().endswith(".jpg")]
-    total = len(image_files)
+    total = len(task_ds)
 
     # 输出目录
     code_tool_suffix = "use_code" if use_code_tool else "no_code"
@@ -344,24 +331,23 @@ async def process_one_type(
     # tqdm 配置
     pbar = tqdm(total=total, desc=f"V* {type_name}", dynamic_ncols=True)
 
-    async def _task(img_name: str):
+    async def _task(item: dict):
         return await process_one_item(
             eval_client=eval_client,
             judge_client=judge_client,
             eval_model_name=eval_model_name,
             judge_model_name=judge_model_name,
-            test_path=test_path,
-            img_name=img_name,
+            item=item,
+            vstar_bench_path=vstar_bench_path,
             use_code_tool=use_code_tool,
             semaphore=semaphore,
             sandbox_url=sandbox_url,
-            tname=type_name,
         )
 
     # 分批提交任务，避免一次性创建全部协程导致内存和调度压力
     for start in range(0, total, max_concurrency):
-        batch = image_files[start : start + max_concurrency]
-        tasks = [asyncio.create_task(_task(img)) for img in batch]
+        batch = task_ds.select(range(start, min(start + max_concurrency, total)))
+        tasks = [asyncio.create_task(_task(item)) for item in batch]
         for coro in asyncio.as_completed(tasks):
             res, acc_int = await coro
             results_to_write.append(res)
@@ -370,7 +356,7 @@ async def process_one_type(
                 "acc": acc_int,
                 "answer": res.get("answer", ""),
             }
-            raw_messages_to_write.append(raw_message)  # 与原一致：消息独立保存
+            raw_messages_to_write.append(raw_message)
             processed += 1
             correct_count += acc_int
             cur_acc = (correct_count / processed) * 100.0 if processed else 0.0
@@ -434,14 +420,22 @@ async def main():
     per_type_stats = []
     overall_correct = 0
     overall_count = 0
+    vstar_bench_path = Path(args.vstar_bench_path) 
+    vstar_bench_path = vstar_bench_path / "test_questions.jsonl"
+    ds = load_dataset("json", data_files=str(vstar_bench_path), split="train")
 
-    for tname in TEST_TYPES:
+    attr_ds = ds.filter(lambda x: x["category"] == "direct_attributes")
+    rel_ds = ds.filter(lambda x: x["category"] == "relative_position")
+
+
+    for tname, task_ds in [("direct_attributes", attr_ds), ("relative_position", rel_ds)]:
         stats = await process_one_type(
             eval_client=eval_client,
             judge_client=judge_client,
             eval_model_name=eval_model_name,
             judge_model_name=judge_model_name,
             type_name=tname,
+            task_ds=task_ds,
             vstar_bench_path=args.vstar_bench_path,
             save_root=save_root,
             use_code_tool=args.use_code_tool,
