@@ -442,7 +442,7 @@ def compute_ground_score(predict_str: str, ground_truth: str, extra_info=None) -
             acc_reward = 0.0
 
     # Penalize for model trying to predict longer answer to hack llm-as-judge
-    if answer_text and len(answer_text) >= 300:
+    if answer_text and len(answer_text) >= 1000:
         is_format_error = True
 
 
@@ -456,8 +456,22 @@ def compute_ground_score(predict_str: str, ground_truth: str, extra_info=None) -
             bboxs.append(bbox)
         return bboxs
 
+    def normlize_bbox(bbox, extra_info):
+        input_width = extra_info["resized_width"]
+        input_height = extra_info["resized_height"]
+        original_width = extra_info["ori_width"]
+        original_height = extra_info["ori_height"]
+
+        x1 = int(bbox[0] / input_width * original_width)
+        x2 = int(bbox[2] / input_width * original_width)
+        y1 = int(bbox[1] / input_height * original_height)
+        y2 = int(bbox[3] / input_height * original_height)
+        bbox = (x1, y1, x2, y2)
+        return bbox
+
     try:
         pred_bboxs = extract_bbox(predict_str)
+        pred_bboxs = [normlize_bbox(bbox, extra_info) for bbox in pred_bboxs]
     except Exception as e:
         print(f" [Extract Bbox ERROR] extract_bbox error: {e}")
         pred_bboxs = []
